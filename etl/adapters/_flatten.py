@@ -3,7 +3,9 @@
 Not part of the public adapter API. Import only from within the adapters package.
 """
 
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -70,15 +72,7 @@ def flatten_dataframe(
     if df is None or df.empty:
         return []
 
-    df = df.copy()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            "_".join(filter(None, (str(s).strip() for s in col))).strip("_")
-            for col in df.columns
-        ]
-
-    df = df.reset_index()
+    df = _flatten_columns(df.copy())
 
     records: list[dict[str, Any]] = []
     for raw in df.to_dict(orient="records"):
@@ -89,3 +83,76 @@ def flatten_dataframe(
         records.append(record)
 
     return records
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Join MultiIndex columns with ``_`` and move the row index into columns.
+
+    Args:
+        df: DataFrame to normalise. Mutated in place for the column rename;
+            ``reset_index`` returns a new frame.
+
+    Returns:
+        DataFrame with flat string columns and the index promoted to columns.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join(filter(None, (str(s).strip() for s in col))).strip("_")
+            for col in df.columns
+        ]
+    return df.reset_index()
+
+
+def spill_dataframe_to_jsonl(
+    df: pd.DataFrame,
+    path: str,
+    source: str,
+    league: str,
+    season: str,
+    chunk_size: int = 5_000,
+) -> int:
+    """Stream a soccerdata DataFrame to a line-delimited JSON file.
+
+    Unlike :func:`flatten_dataframe`, this never materialises the full list of
+    records in memory: rows are converted and written in ``chunk_size`` slices,
+    so peak memory stays flat regardless of row count. Intended for very large
+    batches (e.g. a WhoScored season) where the producing process must avoid
+    both a large in-memory list and a large cross-process pickle.
+
+    The caller owns ``df`` and is expected to discard it afterwards; the column
+    rename mutates it in place to avoid the memory cost of a defensive copy.
+
+    Args:
+        df: Raw DataFrame from a soccerdata reader method.
+        path: Destination file path. One JSON object is written per line.
+        source: Provenance tag injected into every record.
+        league: League identifier injected for traceability.
+        season: Season identifier injected for traceability.
+        chunk_size: Rows converted to dicts at once before being written.
+
+    Returns:
+        Number of records written. Writes an empty file (0 rows) for empty input.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if df is None or df.empty:
+        out.write_text("", encoding="utf-8")
+        return 0
+
+    df = _flatten_columns(df)
+
+    total = 0
+    with out.open("w", encoding="utf-8") as fh:
+        for start in range(0, len(df), chunk_size):
+            sub = df.iloc[start:start + chunk_size]
+            for raw in sub.to_dict(orient="records"):
+                record: dict[str, Any] = {k: _safe_value(v) for k, v in raw.items()}
+                record["_source"] = source
+                record["_league"] = league
+                record["_season"] = season
+                fh.write(json.dumps(record, ensure_ascii=False))
+                fh.write("\n")
+                total += 1
+
+    return total

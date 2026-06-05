@@ -23,3 +23,24 @@ class RepositoryPort(ABC):
             Number of successfully inserted documents (>= 0).
         """
         ...
+
+    @abstractmethod
+    async def save_many_from_jsonl(
+        self, collection: str, path: str, delete_after: bool = True
+    ) -> int:
+        """Persist records streamed from a line-delimited JSON spill file.
+
+        Implementations must read the file incrementally and insert in bounded
+        chunks so that neither the full file nor a large in-memory list is held
+        at once. This is the persistence path for batches too large to keep in
+        memory (see ``ExtractedBatch.jsonl_path``).
+
+        Args:
+            collection: Target collection name within the configured database.
+            path: Path to a line-delimited JSON file, one document per line.
+            delete_after: Remove the spill file once consumed.
+
+        Returns:
+            Number of successfully inserted documents (>= 0).
+        """
+        ...

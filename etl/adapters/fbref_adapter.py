@@ -33,6 +33,8 @@ class FBrefAdapter(ExtractorPort):
     Args:
         data_dir: Local directory used by soccerdata as the HTTP cache.
         executor: Shared thread-pool for all sync scraping workers.
+        max_concurrency: Concurrent ``extract`` calls the orchestrating service
+            may run. FBref returns HTTP 429 under heavier load; keep at 3 or below.
         stat_types: FBref stat categories to pull per (league, season) pair.
     """
 
@@ -40,11 +42,17 @@ class FBrefAdapter(ExtractorPort):
         self,
         data_dir: Path,
         executor: ThreadPoolExecutor,
+        max_concurrency: int = 3,
         stat_types: tuple[str, ...] = FBREF_STAT_TYPES,
     ) -> None:
         self._data_dir = data_dir
         self._executor = executor
+        self._max_concurrency = max_concurrency
         self._stat_types = stat_types
+
+    @property
+    def max_concurrency(self) -> int:
+        return self._max_concurrency
 
     async def extract(self, target: ExtractionTarget) -> list[ExtractedBatch]:
         """Extract schedule and player-season stats for the given target.
