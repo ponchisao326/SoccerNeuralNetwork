@@ -292,3 +292,14 @@ logs/
 *.json
 !league_mappings.json
 !model_hyperparameters.json
+
+# ----------------------------------------
+# ML TRAINING ARTIFACTS
+# ----------------------------------------
+# Generated every training run: vocabularies, scaler stats, run metadata and
+# the binary model weights (.pt). Large and reproducible from the pipeline, so
+# they are never committed. The trailing slash and wildcard guarantee the whole
+# directory is excluded regardless of file extension (overriding the negated
+# *.json allow-list rules above).
+ml/artifacts/
+ml/artifacts/**
