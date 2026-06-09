@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from dotenv import load_dotenv
 from torch import nn
+from torch.nn import functional as F
 
 from ml.config import (
     ARTIFACTS_DIR,
@@ -43,8 +44,12 @@ from ml.data_loader import (
     make_dataloader,
     resolve_split_ranges,
 )
-from ml.features import Vocabulary, build_feature_table, numeric_feature_names
-from ml.model import MatchStatsMultiTaskPredictor, ModelDimensions
+from ml.features import LABEL_DRAW, Vocabulary, build_feature_table, numeric_feature_names
+from ml.model import (
+    MatchStatsMultiTaskPredictor,
+    ModelDimensions,
+    poisson_outcome_probs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,38 +76,49 @@ def set_seed(seed: int) -> None:
 
 
 class CompositeLoss:
-    """Composite multi-task objective with masked regression terms.
+    """Composite multi-task objective built on a Poisson goal model.
 
     Total loss::
 
-        L = L_outcome
+        L = L_goals
+            + lambda_outcome * L_outcome
             + lambda_sot     * L_sot
             + lambda_corners * L_corners
             + lambda_cards   * L_cards
 
-    ``L_outcome`` is class-weighted cross-entropy on raw logits. Each regression
-    term is a *masked* Huber loss: targets that are absent (no WhoScored
-    counterpart, ``mask = 0``) must not contribute gradient. For a head with
-    prediction ``p_i`` and target ``t_i`` over a batch, the masked loss is
+    ``L_goals`` is the Poisson negative log-likelihood of the observed home/away
+    goal counts given the predicted rates (``input - target*log(input)``); it is
+    the primary objective and anchors the scale. The 1X2 outcome is *derived* from
+    those rates (:func:`ml.model.poisson_outcome_probs`), and ``L_outcome`` is a
+    class-weighted negative log-likelihood on that derived simplex. This is the
+    explicit draw-recovery term: the Poisson diagonal already lends the draw a
+    real mechanism, and the inverse-frequency class weights counter the residual
+    under-prediction of draws inherent to an independent (correlation-free)
+    Poisson. Goals are present for every match, so ``L_goals`` and ``L_outcome``
+    are unmasked.
+
+    Each regression term is a *masked* Huber loss: WhoScored-derived targets that
+    are absent (``mask = 0``) must not contribute gradient. For a head with
+    prediction ``p_i`` and target ``t_i``,
 
         L_head = ( sum_i m_i * huber(p_i, t_i) ) / max(sum_i m_i, 1),
 
-    i.e. the mean Huber over *present* samples only. Dividing by the present count
-    (not the batch size) keeps the per-sample scale constant regardless of how
-    many targets are masked, so the loss magnitude -- and thus the effective
-    learning rate -- does not drift with target coverage. When a batch contains no
-    present targets the term is exactly 0 (no NaN). Only the scalar total is
-    returned for ``.backward()``; the per-task components are detached floats for
-    logging.
+    the mean Huber over *present* samples only. Dividing by the present count (not
+    the batch size) keeps the per-sample scale constant regardless of coverage, so
+    the loss magnitude -- and thus the effective learning rate -- does not drift.
+    When a batch has no present targets the term is exactly 0 (no NaN). Only the
+    scalar total is returned for ``.backward()``; the per-task components are
+    detached floats for logging.
 
     Args:
-        class_weights: ``(NUM_CLASSES,)`` inverse-frequency weights for the
-            cross-entropy term.
+        class_weights: ``(NUM_CLASSES,)`` inverse-frequency weights for the derived
+            outcome cross-entropy.
         loss_weights: Static lambda scalars and the Huber transition point.
     """
 
     def __init__(self, class_weights: torch.Tensor, loss_weights: LossWeights) -> None:
-        self._ce = nn.CrossEntropyLoss(weight=class_weights)
+        self._poisson = nn.PoissonNLLLoss(log_input=False, full=False, reduction="mean")
+        self._class_weights = class_weights
         self._huber = nn.HuberLoss(delta=loss_weights.huber_delta, reduction="none")
         self._w = loss_weights
 
@@ -119,10 +135,17 @@ class CompositeLoss:
         self,
         outputs: Dict[str, torch.Tensor],
         outcome: torch.Tensor,
+        goals: torch.Tensor,
         regression: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        loss_ce = self._ce(outputs["outcome"], outcome)
+        loss_goals = self._poisson(outputs["goals"], goals)
+
+        probs = poisson_outcome_probs(outputs["goals"], rho=outputs.get("rho"))
+        loss_outcome = F.nll_loss(
+            torch.log(probs.clamp_min(1e-9)), outcome, weight=self._class_weights
+        )
+
         sot_lo, sot_hi = HEAD_SLICES["sot"]
         cor_lo, cor_hi = HEAD_SLICES["corners"]
         car_lo, car_hi = HEAD_SLICES["cards"]
@@ -131,13 +154,15 @@ class CompositeLoss:
         loss_cards = self._masked_head_loss(outputs["cards"], regression[:, car_lo:car_hi], mask)
 
         total = (
-            loss_ce
+            loss_goals
+            + self._w.lambda_outcome * loss_outcome
             + self._w.lambda_sot * loss_sot
             + self._w.lambda_corners * loss_corners
             + self._w.lambda_cards * loss_cards
         )
         components = {
-            "ce": float(loss_ce.item()),
+            "goals": float(loss_goals.item()),
+            "outcome": float(loss_outcome.item()),
             "sot": float(loss_sot.item()),
             "corners": float(loss_corners.item()),
             "cards": float(loss_cards.item()),
@@ -208,6 +233,69 @@ def _metrics_from_confusion(matrix: np.ndarray) -> Dict[str, float]:
     }
 
 
+def _collect_outcome_probs(
+    model: MatchStatsMultiTaskPredictor,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(probs, labels)`` of the Poisson-derived 1X2 over a loader."""
+    model.eval()
+    probs_chunks: List[np.ndarray] = []
+    label_chunks: List[np.ndarray] = []
+    with torch.no_grad():
+        for numeric, categorical, outcome, _goals, _regression, _mask in loader:
+            outputs = model(numeric.to(device), categorical.to(device))
+            probs = poisson_outcome_probs(outputs["goals"], rho=outputs.get("rho"))
+            probs_chunks.append(probs.cpu().numpy())
+            label_chunks.append(outcome.numpy())
+    return np.concatenate(probs_chunks), np.concatenate(label_chunks)
+
+
+def _confusion_with_draw_boost(
+    probs: np.ndarray, labels: np.ndarray, draw_boost: float
+) -> np.ndarray:
+    """Confusion matrix after scaling the draw probability before the argmax."""
+    adjusted = probs.copy()
+    adjusted[:, LABEL_DRAW] *= draw_boost
+    preds = adjusted.argmax(axis=1)
+    matrix = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
+    for true, pred in zip(labels.tolist(), preds.tolist()):
+        matrix[true, pred] += 1
+    return matrix
+
+
+def tune_draw_boost(
+    probs: np.ndarray, labels: np.ndarray, grid: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """Pick the draw-probability multiplier that maximises macro-F1 on a split.
+
+    Independent/Dixon-Coles Poisson yields well-shaped probabilities, but the
+    plain ``argmax`` almost never returns a draw because P(draw) rarely exceeds
+    both P(home) and P(away). Scaling P(draw) by a constant before the argmax is a
+    cost-sensitive decision rule (equivalent to a class-specific decision
+    threshold) that trades raw accuracy for a balanced macro-F1. The multiplier is
+    selected on the validation split only -- never on test -- so the reported test
+    figure remains an honest out-of-sample estimate.
+
+    Args:
+        probs: ``(N, 3)`` outcome probabilities.
+        labels: ``(N,)`` true class indices.
+        grid: Candidate multipliers (defaults to ``1.0 .. 3.0`` step ``0.1``).
+
+    Returns:
+        ``(best_boost, best_macro_f1)``.
+    """
+    if grid is None:
+        grid = np.round(np.arange(1.0, 3.01, 0.1), 2)
+    best_boost, best_f1 = 1.0, -1.0
+    for boost in grid:
+        matrix = _confusion_with_draw_boost(probs, labels, float(boost))
+        macro_f1 = _metrics_from_confusion(matrix)["macro_f1"]
+        if macro_f1 > best_f1:
+            best_f1, best_boost = macro_f1, float(boost)
+    return best_boost, best_f1
+
+
 def _run_epoch(
     model: MatchStatsMultiTaskPredictor,
     loader: torch.utils.data.DataLoader,
@@ -227,21 +315,23 @@ def _run_epoch(
     matrix = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
     loss_sum = 0.0
     seen = 0
-    component_sums = {"ce": 0.0, "sot": 0.0, "corners": 0.0, "cards": 0.0}
+    component_sums = {"goals": 0.0, "outcome": 0.0, "sot": 0.0, "corners": 0.0, "cards": 0.0}
     abs_error = np.zeros(NUM_REGRESSION_TARGETS, dtype=np.float64)
+    goal_abs_error = np.zeros(2, dtype=np.float64)  # home/away expected-goals MAE
     present_count = 0.0
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for numeric, categorical, outcome, regression, mask in loader:
+        for numeric, categorical, outcome, goals, regression, mask in loader:
             numeric = numeric.to(device)
             categorical = categorical.to(device)
             outcome = outcome.to(device)
+            goals = goals.to(device)
             regression = regression.to(device)
             mask = mask.to(device)
 
             outputs = model(numeric, categorical)
-            total, components = criterion(outputs, outcome, regression, mask)
+            total, components = criterion(outputs, outcome, goals, regression, mask)
 
             if optimizer is not None:
                 optimizer.zero_grad()
@@ -253,7 +343,10 @@ def _run_epoch(
             seen += batch_n
             for key, value in components.items():
                 component_sums[key] += value * batch_n
-            _confusion_counts(outputs["outcome"].detach().cpu(), outcome.cpu(), matrix)
+
+            # Outcome metrics use the Poisson-derived 1X2 distribution.
+            probs = poisson_outcome_probs(outputs["goals"], rho=outputs.get("rho"))
+            _confusion_counts(probs.detach().cpu(), outcome.cpu(), matrix)
 
             # Masked MAE accumulation over present regression targets only.
             predicted = torch.cat([outputs["sot"], outputs["corners"], outputs["cards"]], dim=1)
@@ -261,10 +354,18 @@ def _run_epoch(
             abs_error += masked_abs.sum(dim=0).detach().cpu().numpy()
             present_count += float(mask.sum().item())
 
+            # Expected-goals MAE (always present, no mask).
+            goal_abs_error += (outputs["goals"] - goals).abs().sum(dim=0).detach().cpu().numpy()
+
     avg_loss = loss_sum / seen if seen > 0 else 0.0
     metrics = _metrics_from_confusion(matrix)
     for key, value in component_sums.items():
         metrics[f"loss_{key}"] = value / seen if seen > 0 else 0.0
+
+    goal_mae = goal_abs_error / seen if seen > 0 else goal_abs_error
+    metrics["mae_home_goals"] = float(goal_mae[0])
+    metrics["mae_away_goals"] = float(goal_mae[1])
+    metrics["mae_goals"] = float(np.mean(goal_mae))
 
     denominator = max(present_count, 1.0)
     per_target_mae = abs_error / denominator
@@ -370,10 +471,11 @@ def train(args: argparse.Namespace) -> None:
 
         logger.info(
             "Epoch %03d | train loss %.4f f1 %.3f | val loss %.4f f1 %.3f acc %.3f | "
-            "val MAE sot %.2f cor %.2f card %.2f",
+            "val MAE goals %.2f sot %.2f cor %.2f card %.2f",
             epoch, train_loss, train_metrics["macro_f1"],
             val_loss, val_metrics["macro_f1"], val_metrics["accuracy"],
-            val_metrics["mae_sot"], val_metrics["mae_corners"], val_metrics["mae_cards"],
+            val_metrics["mae_goals"], val_metrics["mae_sot"],
+            val_metrics["mae_corners"], val_metrics["mae_cards"],
         )
 
         if val_loss < best_val_loss - 1e-5:
@@ -399,21 +501,56 @@ def train(args: argparse.Namespace) -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # Tune the draw decision boost on VALIDATION (never test) to rebalance the
+    # minority draw class, then persist it so inference reuses the same rule.
+    val_probs, val_labels = _collect_outcome_probs(model, val_loader, device)
+    draw_boost, val_f1_boosted = tune_draw_boost(val_probs, val_labels)
+    val_f1_argmax = _metrics_from_confusion(
+        _confusion_with_draw_boost(val_probs, val_labels, 1.0)
+    )["macro_f1"]
+    logger.info(
+        "Tuned draw boost on val: %.2f (val macro-F1 %.3f argmax -> %.3f boosted)",
+        draw_boost, val_f1_argmax, val_f1_boosted,
+    )
+
+    if best_state is not None:
+        torch.save(
+            {
+                "model_class": "MatchStatsMultiTaskPredictor",
+                "model_state": best_state,
+                "dims": dims.__dict__,
+                "model_cfg": model_cfg.__dict__,
+                "loss_weights": loss_weights.__dict__,
+                "draw_boost": draw_boost,
+            },
+            _CHECKPOINT_PATH,
+        )
+
     test_loss, test_metrics, test_matrix = _run_epoch(model, test_loader, criterion, device)
+    test_probs, test_labels = _collect_outcome_probs(model, test_loader, device)
+    boosted_matrix = _confusion_with_draw_boost(test_probs, test_labels, draw_boost)
+    boosted_metrics = _metrics_from_confusion(boosted_matrix)
+
     logger.info("=" * 70)
     logger.info("TEST  total loss %.4f", test_loss)
     logger.info(
-        "TEST  outcome: accuracy %.3f | macro-P %.3f macro-R %.3f macro-F1 %.3f",
-        test_metrics["accuracy"], test_metrics["macro_precision"],
-        test_metrics["macro_recall"], test_metrics["macro_f1"],
+        "TEST  outcome (argmax):     accuracy %.3f | macro-F1 %.3f",
+        test_metrics["accuracy"], test_metrics["macro_f1"],
     )
+    logger.info(
+        "TEST  outcome (draw x%.2f): accuracy %.3f | macro-F1 %.3f",
+        draw_boost, boosted_metrics["accuracy"], boosted_metrics["macro_f1"],
+    )
+    logger.info("TEST  expected-goals MAE: home %.3f away %.3f",
+                test_metrics["mae_home_goals"], test_metrics["mae_away_goals"])
     logger.info("TEST  regression MAE (lower is better):")
     for name in REGRESSION_TARGETS:
         logger.info("  %-14s %.3f", name, test_metrics[f"mae_{name}"])
-    logger.info("TEST  confusion matrix (rows=true, cols=pred) %s:", CLASS_NAMES)
-    for cls, row in zip(CLASS_NAMES, test_matrix.tolist()):
+    logger.info("TEST  confusion matrix, draw x%.2f (rows=true, cols=pred) %s:",
+                draw_boost, CLASS_NAMES)
+    for cls, row in zip(CLASS_NAMES, boosted_matrix.tolist()):
         logger.info("  %-9s %s", cls, row)
-    logger.info("Best checkpoint saved to %s", _CHECKPOINT_PATH)
+    logger.info("Best checkpoint saved to %s (draw_boost=%.2f)", _CHECKPOINT_PATH, draw_boost)
 
 
 def _parse_args() -> argparse.Namespace:

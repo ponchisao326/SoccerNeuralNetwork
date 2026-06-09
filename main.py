@@ -1,36 +1,73 @@
 """Entry point: wires dependencies and launches the ETL pipeline."""
 
-import asyncio
-import logging
-import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
-import motor.motor_asyncio
 from dotenv import load_dotenv
 
-from etl.adapters.fbref_adapter import FBrefAdapter
-from etl.adapters.mongo_repository import MongoMatchRepository
-from etl.adapters.whoscored_adapter import WhoScoredAdapter
-from etl.domain.models import ExtractionTarget
-from etl.logging_config import setup_logging
-from etl.memory_guard import MemoryGuard
-from etl.services.ingest_service import IngestService
+# The .env load and SOCCERDATA_DIR registration MUST happen before any soccerdata
+# import (the adapters below import it transitively). soccerdata reads
+# SOCCERDATA_DIR at import time to locate its config directory, and that is where
+# the custom ``league_dict.json`` registering non-default leagues (e.g. the
+# Spanish Segunda Division / LaLiga Hypermotion) lives. ``setdefault`` lets an
+# explicit .env value win, falling back to the version-controlled project config.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env")
+os.environ.setdefault("SOCCERDATA_DIR", str(_PROJECT_ROOT / "soccerdata_config"))
 
-# Load .env from the project root explicitly so it is found regardless of the
-# current working directory. Keep the file at the repository root (not in etl/).
-load_dotenv(Path(__file__).resolve().parent / ".env")
+import asyncio  # noqa: E402
+import logging  # noqa: E402
+import multiprocessing  # noqa: E402
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor  # noqa: E402
 
-LEAGUES: list[str] = [
+import motor.motor_asyncio  # noqa: E402
+
+from etl.adapters.fbref_adapter import FBrefAdapter  # noqa: E402
+from etl.adapters.mongo_repository import MongoMatchRepository  # noqa: E402
+from etl.adapters.whoscored_adapter import WhoScoredAdapter  # noqa: E402
+from etl.domain.models import ExtractionTarget  # noqa: E402
+from etl.logging_config import setup_logging  # noqa: E402
+from etl.memory_guard import MemoryGuard  # noqa: E402
+from etl.services.ingest_service import IngestService  # noqa: E402
+
+_LEAGUES_ALL: list[str] = [
     "ENG-Premier League",
     "ESP-La Liga",
     "ITA-Serie A",
     "GER-Bundesliga",
     "FRA-Ligue 1",
+    # Spanish second division, sponsor name "LaLiga Hypermotion". Not part of
+    # soccerdata's default league dict; registered via soccerdata_config/config/
+    # league_dict.json (FBref name "Spanish Segunda División"). FBref coverage is
+    # verified; the WhoScored tournament name is best-effort, so its event-derived
+    # regression targets may be masked if it does not resolve.
+    "ESP-Segunda Division",
 ]
 
-SEASONS: list[str] = ["2425", "2324", "2223"]
+_SEASONS_ALL: list[str] = ["2526", "2425", "2324", "2223"]
+
+
+def _select(env_var: str, available: list[str]) -> list[str]:
+    """Return an optional comma-separated subset of ``available`` from the env.
+
+    The pipeline has no upsert, so re-running a league already in the database
+    duplicates its documents. This override lets a single new league (or season)
+    be ingested in isolation -- leaving existing collections untouched -- without
+    editing this file, e.g. ``ETL_LEAGUES="ESP-Segunda Division" uv run python
+    main.py``. Unknown entries fail fast so a typo never silently scrapes nothing.
+    """
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return available
+    chosen = [item.strip() for item in raw.split(",") if item.strip()]
+    unknown = [item for item in chosen if item not in available]
+    if unknown:
+        raise SystemExit(f"{env_var}: unknown entries {unknown}. Valid options: {available}")
+    return chosen
+
+
+LEAGUES: list[str] = _select("ETL_LEAGUES", _LEAGUES_ALL)
+SEASONS: list[str] = _select("ETL_SEASONS", _SEASONS_ALL)
 
 MONGODB_URI: str = os.getenv(
     "MONGODB_URI",

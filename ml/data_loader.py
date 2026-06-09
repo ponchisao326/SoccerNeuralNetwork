@@ -26,7 +26,7 @@ import torch
 from pymongo import ASCENDING, MongoClient
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from ml.config import NUM_CLASSES, REGRESSION_TARGETS, MongoConfig
+from ml.config import GOAL_TARGETS, NUM_CLASSES, REGRESSION_TARGETS, MongoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +39,15 @@ CATEGORICAL_FIELDS: Tuple[str, ...] = (
 )
 
 # One training example for the multi-task model:
-#   (numeric features, categorical indices, outcome label, regression targets,
-#    regression mask).
-# The mask is a single 0/1 scalar shared by all regression targets, since they
-# all originate from the same WhoScored join and are therefore present or absent
-# together (see ml.features.build_event_target_index).
+#   (numeric features, categorical indices, outcome label, goal targets,
+#    regression targets, regression mask).
+# ``goals`` (home, away) is always present (parsed from the score) and feeds the
+# Poisson head, so it carries no mask. The single 0/1 ``mask`` covers the
+# WhoScored-derived regression targets, which are present or absent together (see
+# ml.features.build_event_target_index). ``outcome`` (the 1X2 label) is retained
+# for metrics and the class-weighted cross-entropy on the derived probabilities.
 Sample = Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]
 
 
@@ -118,12 +120,16 @@ class MatchFeatureDataset(IterableDataset[Sample]):
             dtype=torch.long,
         )
         outcome = torch.tensor(int(doc["label"]), dtype=torch.long)  # type: ignore[arg-type]
+        goals = torch.tensor(
+            [float(doc[name]) for name in GOAL_TARGETS],  # type: ignore[arg-type]
+            dtype=torch.float32,
+        )
         regression = torch.tensor(
             [float(doc.get(name, 0.0)) for name in REGRESSION_TARGETS],  # type: ignore[arg-type]
             dtype=torch.float32,
         )
         mask = torch.tensor(float(doc.get("targets_present", 0)), dtype=torch.float32)
-        return numeric, categorical, outcome, regression, mask
+        return numeric, categorical, outcome, goals, regression, mask
 
     def _raw_stream(self, client: MongoClient, num_workers: int, worker_id: int) -> Iterator[Sample]:
         """Yield standardised samples from this worker's paged cursor."""

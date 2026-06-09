@@ -257,6 +257,10 @@ secrets.py
 config.py
 downloaded_files/
 soccerdata_cache/
+# soccerdata config home (SOCCERDATA_DIR). Keep the version-controlled custom
+# league dict; ignore the data/logs soccerdata generates underneath it.
+soccerdata_config/data/
+soccerdata_config/logs/
 .claude/
 CLAUDE.md
 etl_pipeline.log

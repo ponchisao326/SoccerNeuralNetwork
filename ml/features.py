@@ -36,10 +36,10 @@ import difflib
 import logging
 import re
 import unicodedata
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
 
 from pymongo import ASCENDING, MongoClient
 
@@ -64,24 +64,33 @@ LABEL_AWAY_WIN: int = 2
 # Ordered numeric feature names. The order is the contract between the feature
 # table, the normalisation scaler and the model input layer; do not reorder
 # without rebuilding the feature table.
+#
+# The per-side block holds exponential moving averages (EMA) of the team's recent
+# performance rather than simple sliding-window means: an EMA weights the most
+# recent match most heavily and decays older matches geometrically, encoding the
+# recency bias that a flat window lacks.
 _PER_SIDE_FEATURES: Tuple[str, ...] = (
-    "gf_avg",      # mean goals scored over the rolling window
-    "ga_avg",      # mean goals conceded over the rolling window
-    "gd_avg",      # mean goal difference (gf - ga) over the window
-    "pts_avg",     # mean league points per game (win=3, draw=1, loss=0)
-    "win_rate",    # fraction of window matches won
-    "draw_rate",   # fraction drawn
-    "loss_rate",   # fraction lost
+    "gf_ema",      # EMA of goals scored
+    "ga_ema",      # EMA of goals conceded
+    "sot_ema",     # EMA of shots on target (the xG proxy), from WhoScored
+    "pts_ema",     # EMA of league points (win=3, draw=1, loss=0)
     "rest_days",   # days since the team's previous match (clamped)
-    "played",      # number of prior matches actually in the window (0..W)
+    "played",      # number of prior matches observed (EMA maturity signal)
+)
+
+# Absolute pre-match ELO ratings of each side. Named explicitly (not h_/a_
+# prefixed) because ELO is a relational rating maintained on a shared scale rather
+# than an independent per-side rolling statistic.
+_ELO_FEATURES: Tuple[str, ...] = (
+    "home_elo",
+    "away_elo",
 )
 
 _DIFF_FEATURES: Tuple[str, ...] = (
-    "gf_avg_diff",     # home gf_avg - away gf_avg
-    "ga_avg_diff",
-    "gd_avg_diff",
-    "pts_avg_diff",
-    "rest_days_diff",
+    "gf_ema_diff",     # home gf_ema - away gf_ema
+    "ga_ema_diff",     # home ga_ema - away ga_ema
+    "pts_ema_diff",    # home pts_ema - away pts_ema
+    "elo_diff",        # home_elo - away_elo (signed strength gap)
 )
 
 _GLOBAL_FEATURES: Tuple[str, ...] = (
@@ -96,6 +105,7 @@ def numeric_feature_names() -> List[str]:
     """
     names: List[str] = [f"h_{f}" for f in _PER_SIDE_FEATURES]
     names += [f"a_{f}" for f in _PER_SIDE_FEATURES]
+    names += list(_ELO_FEATURES)
     names += list(_DIFF_FEATURES)
     names += list(_GLOBAL_FEATURES)
     return names
@@ -130,33 +140,39 @@ def outcome_label(home_goals: int, away_goals: int) -> int:
 
 
 @dataclass
-class _TeamForm:
-    """Incrementally maintained rolling-form state for one team.
+class _TeamState:
+    """Incrementally maintained recency-weighted state for one team.
+
+    Each statistic is stored as an exponential moving average (EMA) scalar instead
+    of a sliding window of raw values, so the per-team memory is O(1) and the most
+    recent fixture dominates the estimate. The EMA trackers are ``Optional`` and
+    start as ``None`` so that the first observed value can seed the average
+    exactly (no spurious decay toward zero on match one). The ELO rating instead
+    starts at a finite base rating, because an unknown team has a meaningful
+    neutral prior whereas its EMA form does not.
 
     Attributes:
-        goals_for: Window of goals scored in the most recent matches.
-        goals_against: Window of goals conceded.
-        points: Window of league points earned (3/1/0).
-        results: Window of result codes (0=win, 1=draw, 2=loss for this team).
-        last_date: Date of the team's most recent processed match, for rest-day
-            computation.
+        elo: Current ELO rating; initialised to ``FeatureConfig.elo_base``.
+        gf_ema: EMA of goals scored, or ``None`` before the first match.
+        ga_ema: EMA of goals conceded.
+        sot_ema: EMA of shots on target (absent for matches without WhoScored
+            coverage, so it may stay ``None`` longer than the goal EMAs).
+        pts_ema: EMA of league points earned (3/1/0).
+        played: Count of prior matches folded in, used as an EMA-maturity signal.
+        last_date: Date of the most recent processed match, for rest-day deltas.
     """
 
-    goals_for: Deque[int]
-    goals_against: Deque[int]
-    points: Deque[int]
-    results: Deque[int]
+    elo: float
+    gf_ema: Optional[float] = None
+    ga_ema: Optional[float] = None
+    sot_ema: Optional[float] = None
+    pts_ema: Optional[float] = None
+    played: int = 0
     last_date: Optional[datetime] = None
 
     @classmethod
-    def empty(cls, window: int) -> "_TeamForm":
-        return cls(
-            goals_for=deque(maxlen=window),
-            goals_against=deque(maxlen=window),
-            points=deque(maxlen=window),
-            results=deque(maxlen=window),
-            last_date=None,
-        )
+    def empty(cls, elo_base: float) -> "_TeamState":
+        return cls(elo=elo_base)
 
 
 class FeatureBuilder:
@@ -169,105 +185,160 @@ class FeatureBuilder:
 
     def __init__(self, config: FeatureConfig) -> None:
         self._cfg = config
-        self._forms: Dict[str, _TeamForm] = {}
+        self._states: Dict[str, _TeamState] = {}
 
-    def _form(self, team: str) -> _TeamForm:
-        form = self._forms.get(team)
-        if form is None:
-            form = _TeamForm.empty(self._cfg.rolling_window)
-            self._forms[team] = form
-        return form
+    def _state(self, team: str) -> _TeamState:
+        state = self._states.get(team)
+        if state is None:
+            state = _TeamState.empty(self._cfg.elo_base)
+            self._states[team] = state
+        return state
+
+    @staticmethod
+    def _emit(value: Optional[float]) -> float:
+        """Map an EMA tracker to a feature value, using 0.0 as the cold-start prior."""
+        return float(value) if value is not None else 0.0
+
+    @staticmethod
+    def _ema_step(old: Optional[float], value: Optional[float], alpha: float) -> Optional[float]:
+        """Advance one EMA tracker by a single observation.
+
+        Implements ``s_t = alpha * x_t + (1 - alpha) * s_{t-1}``. The first
+        observation seeds the average directly (``s_0 = x_0``) so the series is not
+        biased toward zero, and a missing observation (``value is None``) leaves
+        the running average untouched rather than corrupting it with a placeholder.
+        """
+        if value is None:
+            return old
+        if old is None:
+            return float(value)
+        return float(value) * alpha + old * (1.0 - alpha)
 
     def _side_features(self, team: str, match_date: datetime) -> Dict[str, float]:
-        """Compute the pre-match rolling feature block for one team."""
-        form = self._form(team)
-        played = len(form.results)
-        if played == 0:
+        """Compute the pre-match recency-weighted feature block for one team."""
+        state = self._state(team)
+        if state.played == 0:
             # Cold start: neutral priors. ``played=0`` lets the network learn to
             # discount these unreliable rows rather than us imputing strong values.
             return {
-                "gf_avg": 0.0,
-                "ga_avg": 0.0,
-                "gd_avg": 0.0,
-                "pts_avg": 0.0,
-                "win_rate": 0.0,
-                "draw_rate": 0.0,
-                "loss_rate": 0.0,
+                "gf_ema": 0.0,
+                "ga_ema": 0.0,
+                "sot_ema": 0.0,
+                "pts_ema": 0.0,
                 "rest_days": self._cfg.default_rest_days,
                 "played": 0.0,
             }
 
-        gf = sum(form.goals_for) / played
-        ga = sum(form.goals_against) / played
-        wins = sum(1 for r in form.results if r == 0)
-        draws = sum(1 for r in form.results if r == 1)
-        losses = played - wins - draws
-
-        if form.last_date is not None:
-            rest = (match_date - form.last_date).days
+        if state.last_date is not None:
+            rest = (match_date - state.last_date).days
             rest = max(0.0, min(float(rest), self._cfg.max_rest_days))
         else:
             rest = self._cfg.default_rest_days
 
         return {
-            "gf_avg": gf,
-            "ga_avg": ga,
-            "gd_avg": gf - ga,
-            "pts_avg": sum(form.points) / played,
-            "win_rate": wins / played,
-            "draw_rate": draws / played,
-            "loss_rate": losses / played,
+            "gf_ema": self._emit(state.gf_ema),
+            "ga_ema": self._emit(state.ga_ema),
+            "sot_ema": self._emit(state.sot_ema),
+            "pts_ema": self._emit(state.pts_ema),
             "rest_days": rest,
-            "played": float(played),
+            "played": float(state.played),
         }
 
-    def _update(
-        self,
-        team: str,
-        goals_for: int,
-        goals_against: int,
-        match_date: datetime,
-    ) -> None:
-        """Fold a realised result into a team's rolling state (post-emit)."""
-        form = self._form(team)
-        form.goals_for.append(goals_for)
-        form.goals_against.append(goals_against)
-        if goals_for > goals_against:
-            form.points.append(3)
-            form.results.append(0)
-        elif goals_for == goals_against:
-            form.points.append(1)
-            form.results.append(1)
-        else:
-            form.points.append(0)
-            form.results.append(2)
-        form.last_date = match_date
-
-    def process(
+    def _update_team_state(
         self,
         home_team: str,
         away_team: str,
         home_goals: int,
         away_goals: int,
+        home_sot: Optional[float],
+        away_sot: Optional[float],
+        match_date: datetime,
+    ) -> None:
+        """Fold a realised result into both teams' state (strictly post-emit).
+
+        The update is performed jointly because the ELO step is a head-to-head
+        computation. With pre-match ratings ``R_h`` and ``R_a`` the home team's
+        expected score is the logistic
+
+            E_h = 1 / (1 + 10 ** ((R_a - R_h) / 400)),
+
+        and ``E_a = 1 - E_h``. Given the actual home score ``S_h`` in ``{1, 0.5, 0}``
+        for win/draw/loss, both ratings move by the K-scaled surprise
+
+            R' = R + K * (S - E).
+
+        Because expectations are read from the pre-match ratings of *both* sides
+        before either is mutated, the update is order-independent and conserves
+        total rating (the home team's gain equals the away team's loss). The EMA
+        form trackers are advanced afterwards with the same realised statistics.
+        """
+        home_state = self._state(home_team)
+        away_state = self._state(away_team)
+
+        home_elo = home_state.elo
+        away_elo = away_state.elo
+        expected_home = 1.0 / (1.0 + 10.0 ** ((away_elo - home_elo) / 400.0))
+        expected_away = 1.0 - expected_home
+
+        if home_goals > away_goals:
+            actual_home = 1.0
+            home_points, away_points = 3.0, 0.0
+        elif home_goals == away_goals:
+            actual_home = 0.5
+            home_points, away_points = 1.0, 1.0
+        else:
+            actual_home = 0.0
+            home_points, away_points = 0.0, 3.0
+        actual_away = 1.0 - actual_home
+
+        k = self._cfg.elo_k
+        home_state.elo = home_elo + k * (actual_home - expected_home)
+        away_state.elo = away_elo + k * (actual_away - expected_away)
+
+        alpha = self._cfg.ema_alpha
+        home_state.gf_ema = self._ema_step(home_state.gf_ema, float(home_goals), alpha)
+        home_state.ga_ema = self._ema_step(home_state.ga_ema, float(away_goals), alpha)
+        home_state.sot_ema = self._ema_step(home_state.sot_ema, home_sot, alpha)
+        home_state.pts_ema = self._ema_step(home_state.pts_ema, home_points, alpha)
+        home_state.played += 1
+        home_state.last_date = match_date
+
+        away_state.gf_ema = self._ema_step(away_state.gf_ema, float(away_goals), alpha)
+        away_state.ga_ema = self._ema_step(away_state.ga_ema, float(home_goals), alpha)
+        away_state.sot_ema = self._ema_step(away_state.sot_ema, away_sot, alpha)
+        away_state.pts_ema = self._ema_step(away_state.pts_ema, away_points, alpha)
+        away_state.played += 1
+        away_state.last_date = match_date
+
+    def peek_match_features(
+        self,
+        home_team: str,
+        away_team: str,
         match_date: datetime,
         week: Optional[float],
         season_match_span: float,
     ) -> Dict[str, float]:
-        """Emit the pre-match feature vector, then update rolling state.
+        """Compute the pre-match feature vector WITHOUT mutating any team state.
+
+        This is the read-only half of :meth:`process`: it produces the identical
+        19 features a training row receives, but leaves both teams' rolling state
+        untouched. It is the inference entry point, where the upcoming fixture has
+        no result to fold in. Calling it is therefore idempotent and order-free.
 
         Args:
             home_team: Home team name.
             away_team: Away team name.
-            home_goals: Realised home goals (used only for the post-emit update).
-            away_goals: Realised away goals (post-emit update only).
-            match_date: Kickoff date.
+            match_date: Kickoff date (for the rest-days delta).
             week: Matchweek number, or ``None`` if absent.
-            season_match_span: Number of matchweeks in the season, for
-                normalising ``season_progress``.
+            season_match_span: Matchweeks in the season, for ``season_progress``.
 
         Returns:
             Ordered numeric feature dict keyed by :func:`numeric_feature_names`.
         """
+        # Pre-match ratings are read straight from current state (no mutation).
+        home_elo = self._state(home_team).elo
+        away_elo = self._state(away_team).elo
+
         home = self._side_features(home_team, match_date)
         away = self._side_features(away_team, match_date)
 
@@ -277,20 +348,57 @@ class FeatureBuilder:
         for name, value in away.items():
             features[f"a_{name}"] = value
 
-        features["gf_avg_diff"] = home["gf_avg"] - away["gf_avg"]
-        features["ga_avg_diff"] = home["ga_avg"] - away["ga_avg"]
-        features["gd_avg_diff"] = home["gd_avg"] - away["gd_avg"]
-        features["pts_avg_diff"] = home["pts_avg"] - away["pts_avg"]
-        features["rest_days_diff"] = home["rest_days"] - away["rest_days"]
+        features["home_elo"] = home_elo
+        features["away_elo"] = away_elo
+
+        features["gf_ema_diff"] = home["gf_ema"] - away["gf_ema"]
+        features["ga_ema_diff"] = home["ga_ema"] - away["ga_ema"]
+        features["pts_ema_diff"] = home["pts_ema"] - away["pts_ema"]
+        features["elo_diff"] = home_elo - away_elo
 
         if week is not None and season_match_span > 0:
             features["season_progress"] = max(0.0, min(week / season_match_span, 1.0))
         else:
             features["season_progress"] = 0.0
 
+        return features
+
+    def process(
+        self,
+        home_team: str,
+        away_team: str,
+        home_goals: int,
+        away_goals: int,
+        home_sot: Optional[float],
+        away_sot: Optional[float],
+        match_date: datetime,
+        week: Optional[float],
+        season_match_span: float,
+    ) -> Dict[str, float]:
+        """Emit the pre-match feature vector, then update both teams' state.
+
+        Args:
+            home_team: Home team name.
+            away_team: Away team name.
+            home_goals: Realised home goals (used only for the post-emit update).
+            away_goals: Realised away goals (post-emit update only).
+            home_sot: Realised home shots on target, or ``None`` when the match has
+                no WhoScored coverage (post-emit EMA update only).
+            away_sot: Realised away shots on target, or ``None`` (post-emit only).
+            match_date: Kickoff date.
+            week: Matchweek number, or ``None`` if absent.
+            season_match_span: Number of matchweeks in the season, for
+                normalising ``season_progress``.
+
+        Returns:
+            Ordered numeric feature dict keyed by :func:`numeric_feature_names`.
+        """
+        features = self.peek_match_features(home_team, away_team, match_date, week, season_match_span)
+
         # Post-emit state update: strictly after features are read.
-        self._update(home_team, home_goals, away_goals, match_date)
-        self._update(away_team, away_goals, home_goals, match_date)
+        self._update_team_state(
+            home_team, away_team, home_goals, away_goals, home_sot, away_sot, match_date
+        )
 
         return features
 
@@ -763,18 +871,12 @@ def build_feature_table(
             week_value = float(week) if isinstance(week, (int, float)) else None
             span = spans.get((league, season), 0.0)
 
-            features = builder.process(
-                home_team=home_team,
-                away_team=away_team,
-                home_goals=home_goals,
-                away_goals=away_goals,
-                match_date=match_date,
-                week=week_value,
-                season_match_span=span,
-            )
-
             # Join the WhoScored regression targets by (league, season, date,
             # team pair). Orientation (home/away) is taken from the schedule row.
+            # This is resolved before ``process`` so the realised shots on target
+            # can feed the post-emit SOT EMA; the written target values are
+            # unchanged, and the SOT is consumed only after features are emitted,
+            # so the causality (leak-free) guarantee holds.
             date_str = match_date.strftime("%Y-%m-%d")
             game_key: _GameKey = (league, season, date_str, frozenset({home_team, away_team}))
             game_targets = target_index.get(game_key)
@@ -787,10 +889,26 @@ def build_feature_table(
                 a_sot, a_corners, a_cards = game_targets[away_team]
                 targets_present = 1
                 targets_present_total += 1
+                home_sot_obs: Optional[float] = float(h_sot)
+                away_sot_obs: Optional[float] = float(a_sot)
             else:
                 h_sot = h_corners = h_cards = 0
                 a_sot = a_corners = a_cards = 0
                 targets_present = 0
+                home_sot_obs = None
+                away_sot_obs = None
+
+            features = builder.process(
+                home_team=home_team,
+                away_team=away_team,
+                home_goals=home_goals,
+                away_goals=away_goals,
+                home_sot=home_sot_obs,
+                away_sot=away_sot_obs,
+                match_date=match_date,
+                week=week_value,
+                season_match_span=span,
+            )
 
             record: Dict[str, object] = {
                 "row_idx": row_idx,
@@ -804,6 +922,9 @@ def build_feature_table(
                 "league_idx": vocab.league_index(league),
                 "season_idx": vocab.season_index(season),
                 "label": outcome_label(home_goals, away_goals),
+                # Poisson goal targets (always present; source of the derived 1X2).
+                "home_goals": float(home_goals),
+                "away_goals": float(away_goals),
                 # Multi-task regression targets (order matches REGRESSION_TARGETS).
                 "home_sot": float(h_sot),
                 "away_sot": float(a_sot),
@@ -837,3 +958,92 @@ def build_feature_table(
         return vocab, feature_names, row_idx
     finally:
         client.close()
+
+
+def build_team_states(
+    mongo: Optional[MongoConfig] = None,
+    feature_cfg: Optional[FeatureConfig] = None,
+) -> Tuple["FeatureBuilder", Dict[Tuple[str, str], float]]:
+    """Replay the whole chronological schedule to recover every team's live state.
+
+    This is the inference counterpart to :func:`build_feature_table`. It runs the
+    identical leak-free pass -- same date ordering, same WhoScored shots-on-target
+    join feeding the SOT EMA -- but writes nothing. It returns the populated
+    :class:`FeatureBuilder`, whose internal per-team state now holds each club's
+    post-history ELO and exponential moving averages, together with the per-(league,
+    season) matchweek spans. An upcoming, unplayed fixture is then featurised with
+    :meth:`FeatureBuilder.peek_match_features`, guaranteeing the prediction sees the
+    exact same feature construction the model was trained on.
+
+    Args:
+        mongo: Mongo settings (defaults to :class:`MongoConfig`).
+        feature_cfg: Feature settings (defaults to :class:`FeatureConfig`).
+
+    Returns:
+        ``(builder, spans)`` where ``builder`` carries current team state and
+        ``spans`` maps ``(league, season)`` to its maximum matchweek.
+    """
+    mongo = mongo or MongoConfig()
+    feature_cfg = feature_cfg or FeatureConfig()
+
+    client: MongoClient = MongoClient(mongo.uri)
+    try:
+        spans = _season_match_spans(client, mongo)
+        target_index, _ = build_event_target_index(client, mongo)
+        builder = FeatureBuilder(feature_cfg)
+
+        for doc in _iter_schedule(client, mongo):
+            parsed = parse_score(doc.get("score"))  # type: ignore[arg-type]
+            match_date = _coerce_date(doc.get("date"))
+            home_team = doc.get("home_team")
+            away_team = doc.get("away_team")
+            league = doc.get("league")
+            season = doc.get("season")
+            if (
+                parsed is None
+                or match_date is None
+                or not isinstance(home_team, str)
+                or not isinstance(away_team, str)
+                or not isinstance(league, str)
+                or not isinstance(season, str)
+            ):
+                continue
+
+            home_goals, away_goals = parsed
+            date_str = match_date.strftime("%Y-%m-%d")
+            game_key: _GameKey = (league, season, date_str, frozenset({home_team, away_team}))
+            game_targets = target_index.get(game_key)
+            if (
+                game_targets is not None
+                and home_team in game_targets
+                and away_team in game_targets
+            ):
+                home_sot_obs: Optional[float] = float(game_targets[home_team][0])
+                away_sot_obs: Optional[float] = float(game_targets[away_team][0])
+            else:
+                home_sot_obs = None
+                away_sot_obs = None
+
+            week = doc.get("week")
+            week_value = float(week) if isinstance(week, (int, float)) else None
+            span = spans.get((league, season), 0.0)
+            builder.process(
+                home_team=home_team,
+                away_team=away_team,
+                home_goals=home_goals,
+                away_goals=away_goals,
+                home_sot=home_sot_obs,
+                away_sot=away_sot_obs,
+                match_date=match_date,
+                week=week_value,
+                season_match_span=span,
+            )
+        return builder, spans
+    finally:
+        client.close()
+
+
+def has_team_history(builder: "FeatureBuilder", team: str) -> bool:
+    """Return whether ``team`` appears in the replayed state (has prior matches)."""
+    state = builder._states.get(team)  # noqa: SLF001 - inference helper in same module
+    return state is not None and state.played > 0

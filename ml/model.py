@@ -42,13 +42,13 @@ Task heads (branch off the shared representation)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ml.config import NUM_CLASSES
+from ml.config import MAX_GOALS, NUM_CLASSES
 
 
 @dataclass(frozen=True)
@@ -114,12 +114,20 @@ class MatchStatsMultiTaskPredictor(nn.Module):
         self.backbone = nn.Sequential(*layers)
 
         # Task-specific heads branching off the shared representation of width
-        # ``prev``. Each is a single linear projection; the regression heads apply
-        # a ReLU in ``forward`` to enforce non-negativity.
-        self.head_outcome = nn.Linear(prev, NUM_CLASSES)
+        # ``prev``. ``head_goals`` predicts the two Poisson rates (home, away
+        # expected goals); the 1X2 outcome is derived from them analytically (see
+        # :func:`poisson_outcome_probs`) rather than predicted by a separate
+        # softmax. The remaining heads regress non-negative event counts.
+        self.head_goals = nn.Linear(prev, 2)
         self.head_sot = nn.Linear(prev, 2)
         self.head_corners = nn.Linear(prev, 2)
         self.head_cards = nn.Linear(prev, 2)
+
+        # Dixon-Coles dependence parameter: a single global scalar (not match
+        # specific) shared across the dataset, learned jointly with the network.
+        # Initialised to 0 so training starts from the independent-Poisson model
+        # and only departs from it if the data supports extra draw mass.
+        self.dixon_coles_rho = nn.Parameter(torch.zeros(1))
 
         self._init_weights()
 
@@ -145,7 +153,9 @@ class MatchStatsMultiTaskPredictor(nn.Module):
 
         Returns:
             Dict with keys:
-                ``outcome``: ``(B, 3)`` raw class logits (no softmax).
+                ``goals``: ``(B, 2)`` strictly positive home/away expected goals
+                    (Poisson rates). ``softplus`` keeps them in ``(0, inf)`` while
+                    staying smooth near zero, unlike ``exp`` which can explode.
                 ``sot``: ``(B, 2)`` non-negative home/away shots on target.
                 ``corners``: ``(B, 2)`` non-negative home/away corners.
                 ``cards``: ``(B, 2)`` non-negative home/away cards.
@@ -159,8 +169,98 @@ class MatchStatsMultiTaskPredictor(nn.Module):
         latent = self.backbone(features)
 
         return {
-            "outcome": self.head_outcome(latent),
+            "goals": F.softplus(self.head_goals(latent)),
+            "rho": self.dixon_coles_rho,
             "sot": F.relu(self.head_sot(latent)),
             "corners": F.relu(self.head_corners(latent)),
             "cards": F.relu(self.head_cards(latent)),
         }
+
+
+def poisson_outcome_probs(
+    goals: torch.Tensor,
+    rho: Optional[torch.Tensor] = None,
+    max_goals: int = MAX_GOALS,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    """Derive the 1X2 distribution from predicted home/away goal rates.
+
+    Treating the two scorelines as Poisson variables ``H ~ Pois(l_h)`` and
+    ``A ~ Pois(l_a)``, the outcome probabilities are the mass of the joint score
+    grid above, on and below the diagonal::
+
+        P(home win) = sum_{i>j} P(H=i, A=j)
+        P(draw)     = sum_{i=j} P(H=i, A=j)
+        P(away win) = sum_{i<j} P(H=i, A=j)
+
+    Under independence ``P(H=i, A=j) = P(H=i) P(A=j)``. The marginal PMF is
+    evaluated in log space for stability
+    (``log P(X=k) = -l + k*log(l) - lgamma(k+1)``) over ``k in [0, max_goals]``.
+
+    **Dixon-Coles low-score correction.** Independent Poisson systematically
+    under-predicts draws because it cannot represent the positive dependence
+    between the two low scorelines. Following Dixon and Coles (1997) the four
+    lowest cells are multiplied by
+
+        tau(0,0) = 1 - l_h*l_a*rho,   tau(0,1) = 1 + l_h*rho,
+        tau(1,0) = 1 + l_a*rho,       tau(1,1) = 1 - rho,
+
+    (``tau = 1`` elsewhere). A negative ``rho`` inflates the exact draws 0-0 and
+    1-1 and deflates the 1-0 / 0-1 wins, lifting the draw probability for tight,
+    low-scoring fixtures -- precisely where real draws cluster. ``rho`` is a single
+    learnable parameter; at ``rho = 0`` the model collapses back to independent
+    Poisson. Corrected cells are floored at zero to keep the simplex valid for the
+    (negligible) high-rate edge cases. The result is differentiable in both
+    ``(l_h, l_a)`` and ``rho`` and is renormalised. Column order matches
+    :data:`ml.config.CLASS_NAMES` (``home_win, draw, away_win``).
+
+    Args:
+        goals: ``(B, 2)`` strictly positive expected goals ``[l_home, l_away]``.
+        rho: Optional scalar Dixon-Coles dependence parameter. ``None`` or ``0``
+            yields the independent-Poisson derivation.
+        max_goals: Inclusive upper bound of the goal grid.
+        eps: Floor added before logarithms and the final normalisation.
+
+    Returns:
+        ``(B, 3)`` outcome probability simplex.
+    """
+    lam_home = goals[:, 0].clamp_min(eps)
+    lam_away = goals[:, 1].clamp_min(eps)
+
+    k = torch.arange(max_goals + 1, device=goals.device, dtype=goals.dtype)
+    log_factorial = torch.lgamma(k + 1.0)  # (G+1,)
+
+    def _log_pmf(lam: torch.Tensor) -> torch.Tensor:
+        # (B, G+1): log Poisson PMF for each goal count.
+        return (
+            -lam.unsqueeze(1)
+            + k.unsqueeze(0) * torch.log(lam.unsqueeze(1))
+            - log_factorial.unsqueeze(0)
+        )
+
+    p_home = torch.exp(_log_pmf(lam_home))  # (B, G+1)
+    p_away = torch.exp(_log_pmf(lam_away))  # (B, G+1)
+    joint = p_home.unsqueeze(2) * p_away.unsqueeze(1)  # (B, i, j)
+
+    if rho is not None:
+        # Bound the dependence so all tau stay positive for realistic rates.
+        r = 0.15 * torch.tanh(rho).reshape(())
+        tau = torch.ones_like(joint)
+        tau[:, 0, 0] = 1.0 - lam_home * lam_away * r
+        tau[:, 0, 1] = 1.0 + lam_home * r
+        tau[:, 1, 0] = 1.0 + lam_away * r
+        tau[:, 1, 1] = 1.0 - r
+        joint = (joint * tau).clamp_min(0.0)
+
+    i_idx = k.unsqueeze(1)  # (G+1, 1)
+    j_idx = k.unsqueeze(0)  # (1, G+1)
+    home_mask = (i_idx > j_idx).to(joint.dtype)
+    draw_mask = (i_idx == j_idx).to(joint.dtype)
+    away_mask = (i_idx < j_idx).to(joint.dtype)
+
+    p_home_win = (joint * home_mask).sum(dim=(1, 2))
+    p_draw = (joint * draw_mask).sum(dim=(1, 2))
+    p_away_win = (joint * away_mask).sum(dim=(1, 2))
+
+    probs = torch.stack([p_home_win, p_draw, p_away_win], dim=1)
+    return probs / probs.sum(dim=1, keepdim=True).clamp_min(eps)
