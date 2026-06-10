@@ -18,11 +18,22 @@ Search space
   density per decade rather than over-sampling the large-step region.
 * ``dropout_p`` -- uniform on ``[0.1, 0.5]``. Regularisation strength is roughly
   linear in its effect, so a uniform prior is appropriate.
+* ``weight_decay`` -- log-uniform on ``[1e-6, 1e-3]`` (decoupled AdamW L2).
+* ``lambda_outcome`` -- uniform on ``[0.25, 3.0]``: the weight of the derived
+  1X2 cross-entropy against the goal NLL, the primary-task trade-off.
 * ``lambda_sot`` / ``lambda_corners`` / ``lambda_cards`` -- uniform on
   ``[0.1, 2.0]``. These scale the auxiliary regression terms of the composite
   loss. Tuning them searches the multi-task trade-off: how much auxiliary
   gradient signal best regularises the shared backbone for the primary 1X2 task
   without the regression heads dominating the shared representation.
+* ``class_weight_power`` -- uniform on ``[0.0, 1.0]``: exponent on the
+  inverse-frequency class weights (renormalised to mean 1). ``0`` is uniform
+  cross-entropy (typically accuracy-optimal), ``1`` the full draw-recall
+  rebalancing; the optimum depends on the chosen objective.
+* ``team_embedding_dim`` -- categorical {8, 16, 24, 32}.
+* ``hidden_dims`` -- categorical funnel shapes for the MLP trunk.
+* ``time_decay_half_life_days`` -- categorical {0 (off), 180, 390, 730}: the
+  Dixon-Coles recency half-life on the goal NLL.
 
 No data leakage
 ---------------
@@ -71,6 +82,7 @@ from ml.config import (
 from ml.data_loader import (
     MatchFeatureDataset,
     compute_class_weights,
+    compute_max_date,
     compute_normalization_stats,
     make_dataloader,
     resolve_split_ranges,
@@ -111,11 +123,15 @@ class TuningContext:
         train_loader: Streaming loader over the train row range.
         val_loader: Deterministic (unshuffled) loader over the validation range.
         dims: Vocabulary sizes and numeric input width for the model.
-        class_weights: Inverse-frequency 1X2 weights, fit on the train range.
-        base_model_cfg: Architecture defaults; only ``dropout`` is overridden.
+        class_weights: Inverse-frequency 1X2 weights, fit on the train range
+            (trials reshape them via ``class_weight_power``).
+        base_model_cfg: Architecture defaults for the knobs a trial does not
+            sample (league/season embedding dims).
+        reference_day: Latest train-range date (ordinal days) anchoring the
+            Dixon-Coles time decay.
         epochs: Shortened per-trial training budget.
         seed: Global seed re-applied at the start of every trial.
-        objective_kind: ``"f1"`` (maximise macro-F1) or ``"combined"``.
+        objective_kind: ``"logloss"``, ``"accuracy"``, ``"f1"`` or ``"combined"``.
     """
 
     device: torch.device
@@ -124,6 +140,7 @@ class TuningContext:
     dims: ModelDimensions
     class_weights: torch.Tensor
     base_model_cfg: ModelConfig
+    reference_day: float
     epochs: int
     seed: int
     objective_kind: str
@@ -132,9 +149,12 @@ class TuningContext:
 def _trial_score(val_metrics: Dict[str, float], objective_kind: str) -> float:
     """Map a validation-metrics dict to the scalar Optuna maximises.
 
-    For ``"f1"`` the score is the macro-F1 of the outcome head, a bounded,
-    scale-free measure of the primary task. For ``"combined"`` a normalised
-    regression penalty is subtracted::
+    ``"logloss"`` (the recommended default) maximises the negated plain NLL of
+    the derived 1X2 -- the smooth, accuracy-correlated surrogate that is far
+    less tie-prone than argmax metrics under short trial budgets. ``"accuracy"``
+    maximises raw hit rate directly. ``"f1"`` is the macro-F1 of the outcome
+    head. ``"combined"`` subtracts a normalised regression penalty from
+    macro-F1::
 
         score = macro_f1 - gamma * mean_head( MAE_head / reference_head )
 
@@ -142,6 +162,10 @@ def _trial_score(val_metrics: Dict[str, float], objective_kind: str) -> float:
     heterogeneous-scale errors dimensionless before averaging, so no single head
     dominates the penalty purely because its counts are larger.
     """
+    if objective_kind == "logloss":
+        return -val_metrics["outcome_nll"]
+    if objective_kind == "accuracy":
+        return val_metrics["accuracy"]
     macro_f1 = val_metrics["macro_f1"]
     if objective_kind == "f1":
         return macro_f1
@@ -165,32 +189,53 @@ def build_objective(ctx: TuningContext) -> Callable[[optuna.Trial], float]:
     def objective(trial: optuna.Trial) -> float:
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
         dropout_p = trial.suggest_float("dropout_p", 0.1, 0.5)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+        lambda_outcome = trial.suggest_float("lambda_outcome", 0.25, 3.0)
         lambda_sot = trial.suggest_float("lambda_sot", 0.1, 2.0)
         lambda_corners = trial.suggest_float("lambda_corners", 0.1, 2.0)
         lambda_cards = trial.suggest_float("lambda_cards", 0.1, 2.0)
+        class_weight_power = trial.suggest_float("class_weight_power", 0.0, 1.0)
+        team_embedding_dim = trial.suggest_categorical("team_embedding_dim", (8, 16, 24, 32))
+        hidden_dims_key = trial.suggest_categorical(
+            "hidden_dims", ("128-64", "192-96", "256-128", "128-64-32")
+        )
+        half_life = trial.suggest_categorical(
+            "time_decay_half_life_days", (0.0, 180.0, 390.0, 730.0)
+        )
+        hidden_dims = tuple(int(width) for width in hidden_dims_key.split("-"))
 
         # Identical initial conditions per trial: only the sampled knobs vary.
         set_seed(ctx.seed)
 
         model = MatchStatsMultiTaskPredictor(
             dims=ctx.dims,
-            team_embedding_dim=ctx.base_model_cfg.team_embedding_dim,
+            team_embedding_dim=int(team_embedding_dim),
             league_embedding_dim=ctx.base_model_cfg.league_embedding_dim,
             season_embedding_dim=ctx.base_model_cfg.season_embedding_dim,
-            hidden_dims=ctx.base_model_cfg.hidden_dims,
+            hidden_dims=hidden_dims,
             dropout=dropout_p,
         ).to(ctx.device)
 
         loss_weights = LossWeights(
+            lambda_outcome=lambda_outcome,
             lambda_sot=lambda_sot,
             lambda_corners=lambda_corners,
             lambda_cards=lambda_cards,
         )
-        criterion = CompositeLoss(ctx.class_weights, loss_weights)
+        # Exponent-shaped class weights: w^p renormalised to mean 1 spans the
+        # uniform-CE (p=0) to full inverse-frequency (p=1) continuum.
+        class_weights = torch.pow(ctx.class_weights, float(class_weight_power))
+        class_weights = class_weights / class_weights.mean()
+        criterion = CompositeLoss(
+            class_weights,
+            loss_weights,
+            time_decay_half_life_days=float(half_life),
+            reference_day=ctx.reference_day,
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=learning_rate,
-            weight_decay=TrainConfig.weight_decay,
+            weight_decay=weight_decay,
         )
 
         best_score = float("-inf")
@@ -213,6 +258,7 @@ def build_objective(ctx: TuningContext) -> Callable[[optuna.Trial], float]:
         # Persist diagnostics so the study log explains *why* a trial scored well.
         trial.set_user_attr("macro_f1", best_metrics["macro_f1"])
         trial.set_user_attr("accuracy", best_metrics["accuracy"])
+        trial.set_user_attr("outcome_nll", best_metrics["outcome_nll"])
         for head in HEAD_SLICES:
             trial.set_user_attr(f"mae_{head}", best_metrics[f"mae_{head}"])
         return best_score
@@ -259,6 +305,7 @@ def _build_context(args: argparse.Namespace) -> TuningContext:
     # Fit on the train range only; identical to ml.train, so no leakage.
     mean, std = compute_normalization_stats(mongo, feature_names, ranges["train"])
     class_weights = compute_class_weights(mongo, ranges["train"]).to(device)
+    reference_day = compute_max_date(mongo, ranges["train"])
 
     train_ds = MatchFeatureDataset(
         mongo, feature_names, ranges["train"], mean, std,
@@ -285,6 +332,7 @@ def _build_context(args: argparse.Namespace) -> TuningContext:
         dims=dims,
         class_weights=class_weights,
         base_model_cfg=ModelConfig(),
+        reference_day=reference_day,
         epochs=args.epochs,
         seed=args.seed,
         objective_kind=args.objective,
@@ -299,24 +347,34 @@ def _report_study(study: optuna.Study, objective_kind: str) -> None:
                 len(study.trials),
                 len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]))
     logger.info("Best %s score: %.4f", objective_kind, best.value)
-    logger.info("Best trial diagnostics: macro_f1=%.4f acc=%.4f mae_sot=%.3f mae_cor=%.3f mae_card=%.3f",
-                best.user_attrs.get("macro_f1", float("nan")),
-                best.user_attrs.get("accuracy", float("nan")),
-                best.user_attrs.get("mae_sot", float("nan")),
-                best.user_attrs.get("mae_corners", float("nan")),
-                best.user_attrs.get("mae_cards", float("nan")))
+    logger.info(
+        "Best trial diagnostics: nll=%.4f acc=%.4f macro_f1=%.4f mae_sot=%.3f mae_cor=%.3f mae_card=%.3f",
+        best.user_attrs.get("outcome_nll", float("nan")),
+        best.user_attrs.get("accuracy", float("nan")),
+        best.user_attrs.get("macro_f1", float("nan")),
+        best.user_attrs.get("mae_sot", float("nan")),
+        best.user_attrs.get("mae_corners", float("nan")),
+        best.user_attrs.get("mae_cards", float("nan")))
     logger.info("Best hyperparameters:")
     for key, value in best.params.items():
-        logger.info("  %-16s = %s", key, value)
+        logger.info("  %-26s = %s", key, value)
 
     params = best.params
+    hidden_dims = tuple(int(w) for w in str(params["hidden_dims"]).split("-"))
     logger.info("-" * 70)
     logger.info("Apply manually in ml/config.py:")
-    logger.info("  TrainConfig.learning_rate = %.6g", params["learning_rate"])
-    logger.info("  ModelConfig.dropout       = %.4g", params["dropout_p"])
-    logger.info("  LossWeights.lambda_sot     = %.4g", params["lambda_sot"])
-    logger.info("  LossWeights.lambda_corners = %.4g", params["lambda_corners"])
-    logger.info("  LossWeights.lambda_cards   = %.4g", params["lambda_cards"])
+    logger.info("  TrainConfig.learning_rate              = %.6g", params["learning_rate"])
+    logger.info("  TrainConfig.weight_decay               = %.6g", params["weight_decay"])
+    logger.info("  TrainConfig.time_decay_half_life_days  = %.4g", params["time_decay_half_life_days"])
+    logger.info("  ModelConfig.dropout                    = %.4g", params["dropout_p"])
+    logger.info("  ModelConfig.team_embedding_dim         = %d", params["team_embedding_dim"])
+    logger.info("  ModelConfig.hidden_dims                = %s", hidden_dims)
+    logger.info("  LossWeights.lambda_outcome             = %.4g", params["lambda_outcome"])
+    logger.info("  LossWeights.lambda_sot                 = %.4g", params["lambda_sot"])
+    logger.info("  LossWeights.lambda_corners             = %.4g", params["lambda_corners"])
+    logger.info("  LossWeights.lambda_cards               = %.4g", params["lambda_cards"])
+    logger.info("  (class_weight_power %.4g -> apply via TrainConfig.class_weight_power)",
+                params["class_weight_power"])
     logger.info("=" * 70)
 
 
@@ -349,9 +407,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size, help="Mini-batch size.")
     parser.add_argument(
         "--objective",
-        choices=("f1", "combined"),
-        default="f1",
-        help="Maximise outcome macro-F1, or a combined macro-F1 minus normalised regression MAE.",
+        choices=("logloss", "accuracy", "f1", "combined"),
+        default="logloss",
+        help="Validation scalar to maximise: 'logloss' (negated outcome NLL, the "
+        "smooth accuracy surrogate; recommended), 'accuracy', 'f1', or "
+        "'combined' (macro-F1 minus normalised regression MAE).",
     )
     parser.add_argument(
         "--timeout",

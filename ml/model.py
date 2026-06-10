@@ -123,11 +123,13 @@ class MatchStatsMultiTaskPredictor(nn.Module):
         self.head_corners = nn.Linear(prev, 2)
         self.head_cards = nn.Linear(prev, 2)
 
-        # Dixon-Coles dependence parameter: a single global scalar (not match
-        # specific) shared across the dataset, learned jointly with the network.
-        # Initialised to 0 so training starts from the independent-Poisson model
-        # and only departs from it if the data supports extra draw mass.
-        self.dixon_coles_rho = nn.Parameter(torch.zeros(1))
+        # Dixon-Coles dependence and home advantage are league-level effects
+        # (a defensive league's low-score correlation and crowd edge differ from
+        # an offensive one's), so each league gets its own learnable scalar.
+        # Both are zero-initialised: training starts from the independent-Poisson,
+        # no-extra-advantage model and departs only where the data supports it.
+        self.league_rho = nn.Embedding(dims.num_leagues, 1)
+        self.league_home_adv = nn.Embedding(dims.num_leagues, 1)
 
         self._init_weights()
 
@@ -135,6 +137,9 @@ class MatchStatsMultiTaskPredictor(nn.Module):
         """Initialise embeddings (small normal) and linear layers (Kaiming)."""
         for embedding in (self.team_embedding, self.league_embedding, self.season_embedding):
             nn.init.normal_(embedding.weight, mean=0.0, std=0.05)
+        # League-level Poisson corrections must start as exact no-ops.
+        nn.init.zeros_(self.league_rho.weight)
+        nn.init.zeros_(self.league_home_adv.weight)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
@@ -156,6 +161,9 @@ class MatchStatsMultiTaskPredictor(nn.Module):
                 ``goals``: ``(B, 2)`` strictly positive home/away expected goals
                     (Poisson rates). ``softplus`` keeps them in ``(0, inf)`` while
                     staying smooth near zero, unlike ``exp`` which can explode.
+                    The home rate carries a learnable per-league home-advantage
+                    multiplier ``exp(adv_league)`` (zero-init -> multiplier 1).
+                ``rho``: ``(B,)`` per-league Dixon-Coles dependence parameter.
                 ``sot``: ``(B, 2)`` non-negative home/away shots on target.
                 ``corners``: ``(B, 2)`` non-negative home/away corners.
                 ``cards``: ``(B, 2)`` non-negative home/away cards.
@@ -168,9 +176,15 @@ class MatchStatsMultiTaskPredictor(nn.Module):
         features = torch.cat([home, away, league, season, numeric], dim=1)
         latent = self.backbone(features)
 
+        rates = F.softplus(self.head_goals(latent))
+        # exp keeps the multiplier strictly positive and centred at 1 for the
+        # zero-initialised weight; the league index sits at column 2.
+        home_advantage = torch.exp(self.league_home_adv(categorical[:, 2]).squeeze(-1))
+        goals = torch.stack([rates[:, 0] * home_advantage, rates[:, 1]], dim=1)
+
         return {
-            "goals": F.softplus(self.head_goals(latent)),
-            "rho": self.dixon_coles_rho,
+            "goals": goals,
+            "rho": self.league_rho(categorical[:, 2]).squeeze(-1),
             "sot": F.relu(self.head_sot(latent)),
             "corners": F.relu(self.head_corners(latent)),
             "cards": F.relu(self.head_cards(latent)),
@@ -216,8 +230,9 @@ def poisson_outcome_probs(
 
     Args:
         goals: ``(B, 2)`` strictly positive expected goals ``[l_home, l_away]``.
-        rho: Optional scalar Dixon-Coles dependence parameter. ``None`` or ``0``
-            yields the independent-Poisson derivation.
+        rho: Optional Dixon-Coles dependence parameter -- a scalar or a
+            per-sample ``(B,)`` tensor. ``None`` or ``0`` yields the
+            independent-Poisson derivation.
         max_goals: Inclusive upper bound of the goal grid.
         eps: Floor added before logarithms and the final normalisation.
 
@@ -244,7 +259,9 @@ def poisson_outcome_probs(
 
     if rho is not None:
         # Bound the dependence so all tau stay positive for realistic rates.
-        r = 0.15 * torch.tanh(rho).reshape(())
+        # ``rho`` may be a scalar or a per-sample ``(B,)`` tensor (per-league
+        # parameter gathered per row); both broadcast over the batch dimension.
+        r = 0.15 * torch.tanh(rho).reshape(-1)
         tau = torch.ones_like(joint)
         tau[:, 0, 0] = 1.0 - lam_home * lam_away * r
         tau[:, 0, 1] = 1.0 + lam_home * r

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,14 +41,17 @@ CATEGORICAL_FIELDS: Tuple[str, ...] = (
 
 # One training example for the multi-task model:
 #   (numeric features, categorical indices, outcome label, goal targets,
-#    regression targets, regression mask).
+#    regression targets, regression mask, match date as proleptic ordinal days).
 # ``goals`` (home, away) is always present (parsed from the score) and feeds the
 # Poisson head, so it carries no mask. The single 0/1 ``mask`` covers the
 # WhoScored-derived regression targets, which are present or absent together (see
 # ml.features.build_event_target_index). ``outcome`` (the 1X2 label) is retained
 # for metrics and the class-weighted cross-entropy on the derived probabilities.
+# ``date_days`` feeds the Dixon-Coles time-decay weight of the goal NLL during
+# training; it is ignored at evaluation time so reported losses stay unweighted.
 Sample = Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor,
 ]
 
 
@@ -129,7 +133,12 @@ class MatchFeatureDataset(IterableDataset[Sample]):
             dtype=torch.float32,
         )
         mask = torch.tensor(float(doc.get("targets_present", 0)), dtype=torch.float32)
-        return numeric, categorical, outcome, goals, regression, mask
+        raw_date = doc.get("date")
+        date_days = torch.tensor(
+            float(raw_date.toordinal()) if isinstance(raw_date, datetime) else 0.0,
+            dtype=torch.float32,
+        )
+        return numeric, categorical, outcome, goals, regression, mask, date_days
 
     def _raw_stream(self, client: MongoClient, num_workers: int, worker_id: int) -> Iterator[Sample]:
         """Yield standardised samples from this worker's paged cursor."""
@@ -277,6 +286,39 @@ def compute_class_weights(
     inverse = counts.sum() / (NUM_CLASSES * counts)
     inverse = inverse / inverse.mean()  # normalise to mean 1
     return torch.tensor(inverse, dtype=torch.float32)
+
+
+def compute_max_date(
+    mongo: MongoConfig,
+    row_range: Tuple[int, int],
+) -> float:
+    """Return the latest match date of a row range as proleptic ordinal days.
+
+    Used as the Dixon-Coles time-decay reference point ``t_ref``: every training
+    match is weighted by ``0.5 ** ((t_ref - t_match) / half_life)``. Computed on
+    the **train** range so the weighting never observes validation/test dates.
+
+    Args:
+        mongo: Mongo connection settings.
+        row_range: Half-open ``[start, end)`` train range.
+
+    Returns:
+        ``date.toordinal()`` of the most recent match in the range.
+    """
+    start, end = row_range
+    pipeline = [
+        {"$match": {"row_idx": {"$gte": start, "$lt": end}}},
+        {"$group": {"_id": None, "max_date": {"$max": "$date"}}},
+    ]
+    client: MongoClient = MongoClient(mongo.uri)
+    try:
+        collection = client[mongo.db][mongo.feature_collection]
+        result = list(collection.aggregate(pipeline))
+    finally:
+        client.close()
+    if not result or not isinstance(result[0].get("max_date"), datetime):
+        raise RuntimeError("No dated rows found in the range for the decay reference.")
+    return float(result[0]["max_date"].toordinal())
 
 
 def resolve_split_ranges(
